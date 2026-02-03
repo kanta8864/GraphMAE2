@@ -6,11 +6,29 @@ import torch.nn as nn
 from functools import partial
 
 from .gat import GAT
+from .gcn import GCN
 
 from .loss_func import sce_loss
 
 
-def setup_module(m_type, enc_dec, in_dim, num_hidden, out_dim, num_layers, dropout, activation, residual, norm, nhead, nhead_out, attn_drop, negative_slope=0.2, concat_out=True, **kwargs) -> nn.Module:
+def setup_module(
+    m_type,
+    enc_dec,
+    in_dim,
+    num_hidden,
+    out_dim,
+    num_layers,
+    dropout,
+    activation,
+    residual,
+    norm,
+    nhead,
+    nhead_out,
+    attn_drop,
+    negative_slope=0.2,
+    concat_out=True,
+    **kwargs,
+) -> nn.Module:
     if m_type in ("gat", "tsgat"):
         mod = GAT(
             in_dim=in_dim,
@@ -29,52 +47,72 @@ def setup_module(m_type, enc_dec, in_dim, num_hidden, out_dim, num_layers, dropo
             encoding=(enc_dec == "encoding"),
             **kwargs,
         )
+    elif m_type == "gcn":
+        if enc_dec == "encoding":
+            curr_num_hidden = num_hidden // nhead if nhead > 1 else num_hidden
+            curr_out_dim = out_dim
+        else:
+            curr_num_hidden = num_hidden
+            curr_out_dim = out_dim
+
+        mod = GCN(
+            in_dim=in_dim,
+            num_hidden=curr_num_hidden,
+            out_dim=curr_out_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            activation=activation,
+            residual=residual,
+            norm=norm,
+            encoding=(enc_dec == "encoding"),
+        )
     elif m_type == "mlp":
-        # * just for decoder 
+        # * just for decoder
         mod = nn.Sequential(
             nn.Linear(in_dim, num_hidden * 2),
             nn.PReLU(),
             nn.Dropout(0.2),
-            nn.Linear(num_hidden * 2, out_dim)
+            nn.Linear(num_hidden * 2, out_dim),
         )
     elif m_type == "linear":
         mod = nn.Linear(in_dim, out_dim)
     else:
         raise NotImplementedError
-    
+
     return mod
+
 
 class PreModel(nn.Module):
     def __init__(
-            self,
-            in_dim: int,
-            num_hidden: int,
-            num_layers: int,
-            num_dec_layers: int,
-            num_remasking: int,
-            nhead: int,
-            nhead_out: int,
-            activation: str,
-            feat_drop: float,
-            attn_drop: float,
-            negative_slope: float,
-            residual: bool,
-            norm: Optional[str],
-            mask_rate: float = 0.3,
-            remask_rate: float = 0.5,
-            remask_method: str = "random",
-            mask_method: str = "random",
-            encoder_type: str = "gat",
-            decoder_type: str = "gat",
-            loss_fn: str = "byol",
-            drop_edge_rate: float = 0.0,
-            alpha_l: float = 2,
-            lam: float = 1.0,
-            delayed_ema_epoch: int = 0,
-            momentum: float = 0.996,
-            replace_rate: float = 0.0,
-            zero_init: bool = False,
-         ):
+        self,
+        in_dim: int,
+        num_hidden: int,
+        num_layers: int,
+        num_dec_layers: int,
+        num_remasking: int,
+        nhead: int,
+        nhead_out: int,
+        activation: str,
+        feat_drop: float,
+        attn_drop: float,
+        negative_slope: float,
+        residual: bool,
+        norm: Optional[str],
+        mask_rate: float = 0.3,
+        remask_rate: float = 0.5,
+        remask_method: str = "random",
+        mask_method: str = "random",
+        encoder_type: str = "gat",
+        decoder_type: str = "gat",
+        loss_fn: str = "byol",
+        drop_edge_rate: float = 0.0,
+        alpha_l: float = 2,
+        lam: float = 1.0,
+        delayed_ema_epoch: int = 0,
+        momentum: float = 0.996,
+        replace_rate: float = 0.0,
+        zero_init: bool = False,
+    ):
         super(PreModel, self).__init__()
         self._mask_rate = mask_rate
         self._remask_rate = remask_rate
@@ -105,7 +143,7 @@ class PreModel(nn.Module):
             enc_nhead = 1
 
         dec_in_dim = num_hidden
-        dec_num_hidden = num_hidden // nhead if decoder_type in ("gat",) else num_hidden 
+        dec_num_hidden = num_hidden // nhead if decoder_type in ("gat",) else num_hidden
 
         # build encoder
         self.encoder = setup_module(
@@ -127,35 +165,34 @@ class PreModel(nn.Module):
         )
 
         self.decoder = setup_module(
-                m_type=decoder_type,
-                enc_dec="decoding",
-                in_dim=dec_in_dim,
-                num_hidden=dec_num_hidden,
-                out_dim=in_dim,
-                nhead_out=nhead_out,
-                num_layers=num_dec_layers,
-                nhead=nhead,
-                activation=activation,
-                dropout=feat_drop,
-                attn_drop=attn_drop,
-                negative_slope=negative_slope,
-                residual=residual,
-                norm=norm,
-                concat_out=True,
-            )
+            m_type=decoder_type,
+            enc_dec="decoding",
+            in_dim=dec_in_dim,
+            num_hidden=dec_num_hidden,
+            out_dim=in_dim,
+            nhead_out=nhead_out,
+            num_layers=num_dec_layers,
+            nhead=nhead,
+            activation=activation,
+            dropout=feat_drop,
+            attn_drop=attn_drop,
+            negative_slope=negative_slope,
+            residual=residual,
+            norm=norm,
+            concat_out=True,
+        )
 
         self.enc_mask_token = nn.Parameter(torch.zeros(1, in_dim))
         self.dec_mask_token = nn.Parameter(torch.zeros(1, num_hidden))
 
         self.encoder_to_decoder = nn.Linear(dec_in_dim, dec_in_dim, bias=False)
-        
+
         if not zero_init:
             self.reset_parameters_for_token()
 
-
         # * setup loss function
         self.criterion = self.setup_loss_fn(loss_fn, alpha_l)
-        
+
         self.projector = nn.Sequential(
             nn.Linear(num_hidden, 256),
             nn.PReLU(),
@@ -166,11 +203,8 @@ class PreModel(nn.Module):
             nn.PReLU(),
             nn.Linear(256, num_hidden),
         )
-        self.predictor = nn.Sequential(
-            nn.PReLU(),
-            nn.Linear(num_hidden, num_hidden)
-        )
-        
+        self.predictor = nn.Sequential(nn.PReLU(), nn.Linear(num_hidden, num_hidden))
+
         self.encoder_ema = setup_module(
             m_type=encoder_type,
             enc_dec="encoding",
@@ -197,15 +231,21 @@ class PreModel(nn.Module):
         for p in self.projector_ema.parameters():
             p.requires_grad = False
             p.detach_()
-        
+
         self.print_num_parameters()
 
     def print_num_parameters(self):
-        num_encoder_params = [p.numel() for p in self.encoder.parameters() if  p.requires_grad]
-        num_decoder_params = [p.numel() for p in self.decoder.parameters() if  p.requires_grad]
+        num_encoder_params = [
+            p.numel() for p in self.encoder.parameters() if p.requires_grad
+        ]
+        num_decoder_params = [
+            p.numel() for p in self.decoder.parameters() if p.requires_grad
+        ]
         num_params = [p.numel() for p in self.parameters() if p.requires_grad]
 
-        print(f"num_encoder_params: {sum(num_encoder_params)}, num_decoder_params: {sum(num_decoder_params)}, num_params_in_total: {sum(num_params)}")
+        print(
+            f"num_encoder_params: {sum(num_encoder_params)}, num_decoder_params: {sum(num_decoder_params)}, num_params_in_total: {sum(num_params)}"
+        )
 
     def reset_parameters_for_token(self):
         nn.init.xavier_normal_(self.enc_mask_token)
@@ -227,20 +267,30 @@ class PreModel(nn.Module):
             raise NotImplementedError
         return criterion
 
-    def forward(self, g, x, targets=None, epoch=0, drop_g1=None, drop_g2=None):        # ---- attribute reconstruction ----
+    def forward(
+        self, g, x, targets=None, epoch=0, drop_g1=None, drop_g2=None
+    ):  # ---- attribute reconstruction ----
         loss = self.mask_attr_prediction(g, x, targets, epoch, drop_g1, drop_g2)
 
         return loss
 
     def mask_attr_prediction(self, g, x, targets, epoch, drop_g1=None, drop_g2=None):
-        pre_use_g, use_x, (mask_nodes, keep_nodes) = self.encoding_mask_noise(g, x, self._mask_rate)
+        pre_use_g, use_x, (mask_nodes, keep_nodes) = self.encoding_mask_noise(
+            g, x, self._mask_rate
+        )
         use_g = drop_g1 if drop_g1 is not None else g
 
-        enc_rep = self.encoder(use_g, use_x,)
+        enc_rep = self.encoder(
+            use_g,
+            use_x,
+        )
 
         with torch.no_grad():
             drop_g2 = drop_g2 if drop_g2 is not None else g
-            latent_target = self.encoder_ema(drop_g2, x,)
+            latent_target = self.encoder_ema(
+                drop_g2,
+                x,
+            )
             if targets is not None:
                 latent_target = self.projector_ema(latent_target[targets])
             else:
@@ -262,7 +312,9 @@ class PreModel(nn.Module):
         if self._remask_method == "random":
             for i in range(self._num_remasking):
                 rep = origin_rep.clone()
-                rep, remask_nodes, rekeep_nodes = self.random_remask(use_g, rep, self._remask_rate)
+                rep, remask_nodes, rekeep_nodes = self.random_remask(
+                    use_g, rep, self._remask_rate
+                )
                 recon = self.decoder(pre_use_g, rep)
 
                 x_init = x[mask_nodes]
@@ -287,10 +339,11 @@ class PreModel(nn.Module):
     def ema_update(self):
         def update(student, teacher):
             with torch.no_grad():
-            # m = momentum_schedule[it]  # momentum parameter
+                # m = momentum_schedule[it]  # momentum parameter
                 m = self._momentum
                 for param_q, param_k in zip(student.parameters(), teacher.parameters()):
                     param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+
         update(self.encoder, self.encoder_ema)
         update(self.projector, self.projector_ema)
 
@@ -299,16 +352,16 @@ class PreModel(nn.Module):
         return rep
 
     def get_encoder(self):
-        #self.encoder.reset_classifier(out_size)
+        # self.encoder.reset_classifier(out_size)
         return self.encoder
-    
+
     def reset_encoder(self, out_size):
         self.encoder.reset_classifier(out_size)
- 
+
     @property
     def enc_params(self):
         return self.encoder.parameters()
-    
+
     @property
     def dec_params(self):
         return chain(*[self.encoder_to_decoder.parameters(), self.decoder.parameters()])
@@ -319,7 +372,7 @@ class PreModel(nn.Module):
             if p.grad is not None:
                 grad_dict[n] = p.grad.abs().mean().item()
         return grad_dict
-    
+
     def encoding_mask_noise(self, g, x, mask_rate=0.3):
         num_nodes = g.num_nodes()
         perm = torch.randperm(num_nodes, device=x.device)
@@ -336,8 +389,8 @@ class PreModel(nn.Module):
 
         # random masking
         num_mask_nodes = int(mask_rate * num_nodes)
-        mask_nodes = perm[: num_mask_nodes]
-        keep_nodes = perm[num_mask_nodes: ]
+        mask_nodes = perm[:num_mask_nodes]
+        keep_nodes = perm[num_mask_nodes:]
 
         out_x = x.clone()
         token_nodes = mask_nodes
@@ -347,14 +400,14 @@ class PreModel(nn.Module):
         use_g = g.clone()
 
         return use_g, out_x, (mask_nodes, keep_nodes)
-    
-    def random_remask(self,g,rep,remask_rate=0.5):
-        
+
+    def random_remask(self, g, rep, remask_rate=0.5):
+
         num_nodes = g.num_nodes()
         perm = torch.randperm(num_nodes, device=rep.device)
         num_remask_nodes = int(remask_rate * num_nodes)
-        remask_nodes = perm[: num_remask_nodes]
-        rekeep_nodes = perm[num_remask_nodes: ]
+        remask_nodes = perm[:num_remask_nodes]
+        rekeep_nodes = perm[num_remask_nodes:]
 
         rep = rep.clone()
         rep[remask_nodes] = 0

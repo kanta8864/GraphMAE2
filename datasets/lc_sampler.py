@@ -12,10 +12,13 @@ import logging
 import torch.multiprocessing
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-torch.multiprocessing.set_sharing_strategy('file_system')
+
+torch.multiprocessing.set_sharing_strategy("file_system")
 
 
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
+)
 
 # def collect_topk_ppr(graph, nodes, topk, alpha, epsilon):
 #     if torch.is_tensor(nodes):
@@ -32,8 +35,49 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 
 
 def load_dataset(data_dir, dataset_name):
+    # --- BLOCK 1: Load your Custom PyG Graph ---
+    if dataset_name == "custom":
+        print(
+            f"Loading custom graph from: {os.path.join(data_dir, 'public_graph_for_mae.pt')}"
+        )
+
+        # 1. Load the PyG dictionary you saved
+        data_dict = torch.load(os.path.join(data_dir, "public_graph_for_mae.pt"))
+
+        # 2. Extract Tensors
+        x = data_dict["x"]
+        edge_index = data_dict["edge_index"]  # Shape [2, Num_Edges]
+        num_nodes = x.shape[0]
+
+        # 3. Convert PyG edge_index to DGL Graph
+        # DGL expects (source_tensor, destination_tensor)
+        src = edge_index[0]
+        dst = edge_index[1]
+        graph = dgl.graph((src, dst), num_nodes=num_nodes)
+
+        # 4. Preprocessing (Standard GraphMAE steps)
+        # Make graph undirected (add reverse edges) and add self-loops
+        graph = dgl.to_bidirected(graph)
+        graph = graph.remove_self_loop().add_self_loop()
+
+        # 5. Features
+        feats = x.float()
+
+        # 6. Dummy Labels & Splits (Required by the pipeline, even if unused for pre-training)
+        # We just create fake labels (all zeros) and say every node is a training node
+        label = torch.zeros(num_nodes, dtype=torch.long)
+
+        # Create a dummy split index covering all nodes
+        all_nodes = torch.arange(num_nodes, dtype=torch.long)
+        split_idx = {"train": all_nodes, "valid": all_nodes, "test": all_nodes}
+
+        return feats, graph, label, split_idx
+
+    # --- BLOCK 2: Original Logic (Keep this for reference) ---
     if dataset_name.startswith("ogbn"):
-        dataset = DglNodePropPredDataset(dataset_name, root=os.path.join(data_dir, "dataset"))
+        dataset = DglNodePropPredDataset(
+            dataset_name, root=os.path.join(data_dir, "dataset")
+        )
         graph, label = dataset[0]
 
         if "year" in graph.ndata:
@@ -46,25 +90,28 @@ def load_dataset(data_dir, dataset_name):
         split_idx = dataset.get_idx_split()
         label = label.view(-1)
 
-        feats = graph.ndata.pop("feat") 
-        if dataset_name in ("ogbn-arxiv","ogbn-papers100M"):
+        feats = graph.ndata.pop("feat")
+        if dataset_name in ("ogbn-arxiv", "ogbn-papers100M"):
             feats = scale_feats(feats)
+
     elif dataset_name == "mag-scholar-f":
         edge_index = np.load(os.path.join(data_dir, dataset_name, "edge_index_f.npy"))
-        feats = torch.from_numpy(np.load(os.path.join(data_dir, "feature_f.npy"))).float()
+        feats = torch.from_numpy(
+            np.load(os.path.join(data_dir, "feature_f.npy"))
+        ).float()
 
         graph = dgl.DGLGraph((edge_index[0], edge_index[1]))
 
         graph = dgl.remove_self_loop(graph)
         graph = dgl.add_self_loop(graph)
 
-        label = torch.from_numpy(np.load(os.path.join(data_dir, "label_f.npy"))).to(torch.long)
+        label = torch.from_numpy(np.load(os.path.join(data_dir, "label_f.npy"))).to(
+            torch.long
+        )
         split_idx = torch.load(os.path.join(data_dir, "split_idx_f.pt"))
 
-        # graph.ndata["feat"] = feats
-        # graph.ndata["label"] = label  
-
     return feats, graph, label, split_idx
+
 
 class LinearProbingDataLoader(DataLoader):
     def __init__(self, idx, feats, labels=None, **kwargs):
@@ -79,9 +126,12 @@ class LinearProbingDataLoader(DataLoader):
         label = self.labels[batch_idx]
 
         return feats, label
-    
+
+
 class OnlineLCLoader(DataLoader):
-    def __init__(self, root_nodes, graph, feats, labels=None, drop_edge_rate=0, **kwargs):
+    def __init__(
+        self, root_nodes, graph, feats, labels=None, drop_edge_rate=0, **kwargs
+    ):
         self.graph = graph
         self.labels = labels
         self._drop_edge_rate = drop_edge_rate
@@ -123,7 +173,7 @@ class OnlineLCLoader(DataLoader):
             label = self.labels[batch_idx]
         else:
             label = None
-        
+
         if self._drop_edge_rate > 0:
             return sg, targets, label, nodes, drop_g1, drop_g2
         else:
@@ -138,7 +188,7 @@ def setup_training_data(dataset_name, data_dir, ego_graphs_file_path):
     test_lbls = labels[split_idx["test"]]
 
     labels = torch.cat([train_lbls, val_lbls, test_lbls])
-    
+
     os.makedirs(os.path.dirname(ego_graphs_file_path), exist_ok=True)
 
     if not os.path.exists(ego_graphs_file_path):
@@ -149,38 +199,81 @@ def setup_training_data(dataset_name, data_dir, ego_graphs_file_path):
     return feats, graph, labels, split_idx, nodes
 
 
-def setup_training_dataloder(loader_type, training_nodes, graph, feats, batch_size, drop_edge_rate=0, pretrain_clustergcn=False, cluster_iter_data=None):
+def setup_training_dataloder(
+    loader_type,
+    training_nodes,
+    graph,
+    feats,
+    batch_size,
+    drop_edge_rate=0,
+    pretrain_clustergcn=False,
+    cluster_iter_data=None,
+):
     num_workers = 8
 
     if loader_type == "lc":
         assert training_nodes is not None
     else:
         raise NotImplementedError(f"{loader_type} is not implemented yet")
-    
+
     # print(" -------- drop edge rate: {} --------".format(drop_edge_rate))
-    dataloader = OnlineLCLoader(training_nodes, graph, feats=feats, drop_edge_rate=drop_edge_rate, batch_size=batch_size, shuffle=True, drop_last=False, persistent_workers=True, num_workers=num_workers)
+    dataloader = OnlineLCLoader(
+        training_nodes,
+        graph,
+        feats=feats,
+        drop_edge_rate=drop_edge_rate,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False,
+        persistent_workers=True,
+        num_workers=num_workers,
+    )
     return dataloader
 
 
-def setup_eval_dataloder(loader_type, graph, feats, ego_graph_nodes=None, batch_size=128, shuffle=False):
+def setup_eval_dataloder(
+    loader_type, graph, feats, ego_graph_nodes=None, batch_size=128, shuffle=False
+):
     num_workers = 8
     if loader_type == "lc":
         assert ego_graph_nodes is not None
     else:
         raise NotImplementedError(f"{loader_type} is not implemented yet")
 
-    dataloader = OnlineLCLoader(ego_graph_nodes, graph, feats, batch_size=batch_size, shuffle=shuffle, drop_last=False, persistent_workers=True, num_workers=num_workers)
+    dataloader = OnlineLCLoader(
+        ego_graph_nodes,
+        graph,
+        feats,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=False,
+        persistent_workers=True,
+        num_workers=num_workers,
+    )
     return dataloader
 
 
-def setup_finetune_dataloder(loader_type, graph, feats, ego_graph_nodes, labels, batch_size, shuffle=False):
+def setup_finetune_dataloder(
+    loader_type, graph, feats, ego_graph_nodes, labels, batch_size, shuffle=False
+):
     num_workers = 8
 
     if loader_type == "lc":
         assert ego_graph_nodes is not None
     else:
         raise NotImplementedError(f"{loader_type} is not implemented yet")
-    
-    dataloader = OnlineLCLoader(ego_graph_nodes, graph, feats, labels=labels, feats=feats, batch_size=batch_size, shuffle=shuffle, drop_last=False, num_workers=num_workers, persistent_workers=True)
-    
+
+    dataloader = OnlineLCLoader(
+        ego_graph_nodes,
+        graph,
+        feats,
+        labels=labels,
+        feats=feats,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=False,
+        num_workers=num_workers,
+        persistent_workers=True,
+    )
+
     return dataloader

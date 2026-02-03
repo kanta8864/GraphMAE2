@@ -7,6 +7,7 @@ from dgl.data import CoraGraphDataset, CiteseerGraphDataset, PubmedGraphDataset
 from ogb.nodeproppred import DglNodePropPredDataset
 
 from sklearn.preprocessing import StandardScaler
+import os
 
 
 GRAPH_DICT = {
@@ -14,10 +15,55 @@ GRAPH_DICT = {
     "citeseer": CiteseerGraphDataset,
     "pubmed": PubmedGraphDataset,
     "ogbn-arxiv": DglNodePropPredDataset,
+    "custom": None,
 }
+
 
 def load_small_dataset(dataset_name):
     assert dataset_name in GRAPH_DICT, f"Unknow dataset: {dataset_name}."
+
+    # --- BLOCK: Custom Graph Loading Logic ---
+    if dataset_name == "custom":
+        # Hardcoding path to ./data/public_graph_for_mae.pt
+        file_path = os.path.join("data", "public_graph_for_mae.pt")
+        print(f"Loading custom graph from: {file_path}")
+
+        data_dict = torch.load(file_path)
+        x = data_dict["x"]
+        edge_index = data_dict["edge_index"]
+        num_nodes = x.shape[0]
+
+        # Convert to DGL
+        # DGL expects (u, v) tuples or arrays
+        src = edge_index[0]
+        dst = edge_index[1]
+        graph = dgl.graph((src, dst), num_nodes=num_nodes)
+
+        # Preprocessing (Undirected + Self-loops)
+        graph = dgl.to_bidirected(graph)
+        graph = graph.remove_self_loop().add_self_loop()
+
+        # Set Features
+        graph.ndata["feat"] = x.float()
+
+        # Set Labels (Create dummy if missing)
+        if "y" in data_dict and data_dict["y"] is not None:
+            graph.ndata["label"] = data_dict["y"]
+            num_classes = int(data_dict["y"].max().item()) + 1
+        else:
+            print("No labels found, using dummy labels.")
+            graph.ndata["label"] = torch.zeros(num_nodes, dtype=torch.long)
+            num_classes = 1
+
+        # Set Masks (Required by training loop)
+        # We set all nodes to train since this is unsupervised pre-training
+        graph.ndata["train_mask"] = torch.ones(num_nodes, dtype=torch.bool)
+        graph.ndata["val_mask"] = torch.ones(num_nodes, dtype=torch.bool)
+        graph.ndata["test_mask"] = torch.ones(num_nodes, dtype=torch.bool)
+
+        num_features = graph.ndata["feat"].shape[1]
+        return graph, (num_features, num_classes)
+
     if dataset_name.startswith("ogbn"):
         dataset = GRAPH_DICT[dataset_name](dataset_name)
     else:
@@ -28,7 +74,11 @@ def load_small_dataset(dataset_name):
         num_nodes = graph.num_nodes()
 
         split_idx = dataset.get_idx_split()
-        train_idx, val_idx, test_idx = split_idx["train"], split_idx["valid"], split_idx["test"]
+        train_idx, val_idx, test_idx = (
+            split_idx["train"],
+            split_idx["valid"],
+            split_idx["test"],
+        )
         graph = preprocess(graph)
 
         if not torch.is_tensor(train_idx):
@@ -44,7 +94,11 @@ def load_small_dataset(dataset_name):
         val_mask = torch.full((num_nodes,), False).index_fill_(0, val_idx, True)
         test_mask = torch.full((num_nodes,), False).index_fill_(0, test_idx, True)
         graph.ndata["label"] = labels.view(-1)
-        graph.ndata["train_mask"], graph.ndata["val_mask"], graph.ndata["test_mask"] = train_mask, val_mask, test_mask
+        graph.ndata["train_mask"], graph.ndata["val_mask"], graph.ndata["test_mask"] = (
+            train_mask,
+            val_mask,
+            test_mask,
+        )
     else:
         graph = dataset[0]
         graph = graph.remove_self_loop()
@@ -52,6 +106,7 @@ def load_small_dataset(dataset_name):
     num_features = graph.ndata["feat"].shape[1]
     num_classes = dataset.num_classes
     return graph, (num_features, num_classes)
+
 
 def preprocess(graph):
     # make bidirected

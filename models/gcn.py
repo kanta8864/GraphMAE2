@@ -10,17 +10,18 @@ from utils import create_activation, create_norm
 
 
 class GCN(nn.Module):
-    def __init__(self,
-                 in_dim,
-                 num_hidden,
-                 out_dim,
-                 num_layers,
-                 dropout,
-                 activation,
-                 residual,
-                 norm,
-                 encoding=False
-                 ):
+    def __init__(
+        self,
+        in_dim,
+        num_hidden,
+        out_dim,
+        num_layers,
+        dropout,
+        activation,
+        residual,
+        norm,
+        encoding=False,
+    ):
         super(GCN, self).__init__()
         self.out_dim = out_dim
         self.num_layers = num_layers
@@ -31,22 +32,50 @@ class GCN(nn.Module):
         last_activation = create_activation(activation) if encoding else None
         last_residual = encoding and residual
         last_norm = norm if encoding else None
-        
+
         if num_layers == 1:
-            self.gcn_layers.append(GraphConv(
-                in_dim, out_dim, residual=last_residual, norm=last_norm, activation=last_activation))
+            self.gcn_layers.append(
+                GraphConv(
+                    in_dim,
+                    out_dim,
+                    residual=last_residual,
+                    norm=last_norm,
+                    activation=last_activation,
+                )
+            )
         else:
             # input projection (no residual)
-            self.gcn_layers.append(GraphConv(
-                in_dim, num_hidden, residual=residual, norm=norm, activation=create_activation(activation)))
+            self.gcn_layers.append(
+                GraphConv(
+                    in_dim,
+                    num_hidden,
+                    residual=residual,
+                    norm=norm,
+                    activation=create_activation(activation),
+                )
+            )
             # hidden layers
             for l in range(1, num_layers - 1):
                 # due to multi-head, the in_dim = num_hidden * num_heads
-                self.gcn_layers.append(GraphConv(
-                    num_hidden, num_hidden, residual=residual, norm=norm, activation=create_activation(activation)))
+                self.gcn_layers.append(
+                    GraphConv(
+                        num_hidden,
+                        num_hidden,
+                        residual=residual,
+                        norm=norm,
+                        activation=create_activation(activation),
+                    )
+                )
             # output projection
-            self.gcn_layers.append(GraphConv(
-                num_hidden, out_dim, residual=last_residual, activation=last_activation, norm=last_norm))
+            self.gcn_layers.append(
+                GraphConv(
+                    num_hidden,
+                    out_dim,
+                    residual=last_residual,
+                    activation=last_activation,
+                    norm=last_norm,
+                )
+            )
 
         # if norm is not None:
         #     self.norms = nn.ModuleList([
@@ -82,13 +111,14 @@ class GCN(nn.Module):
 
 
 class GraphConv(nn.Module):
-    def __init__(self,
-                 in_dim,
-                 out_dim,
-                 norm=None,
-                 activation=None,
-                 residual=True,
-                 ):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        norm=None,
+        activation=None,
+        residual=True,
+    ):
         super().__init__()
         self._in_feats = in_dim
         self._out_feats = out_dim
@@ -97,14 +127,13 @@ class GraphConv(nn.Module):
 
         if residual:
             if self._in_feats != self._out_feats:
-                self.res_fc = nn.Linear(
-                    self._in_feats, self._out_feats, bias=False)
+                self.res_fc = nn.Linear(self._in_feats, self._out_feats, bias=False)
                 print("! Linear Residual !")
             else:
                 print("Identity Residual ")
                 self.res_fc = nn.Identity()
         else:
-            self.register_buffer('res_fc', None)
+            self.register_buffer("res_fc", None)
 
         # if norm == "batchnorm":
         #     self.norm = nn.BatchNorm1d(out_dim)
@@ -112,7 +141,7 @@ class GraphConv(nn.Module):
         #     self.norm = nn.LayerNorm(out_dim)
         # else:
         #     self.norm = None
-        
+
         self.norm = norm
         if norm is not None:
             self.norm = create_norm(norm)(out_dim)
@@ -125,7 +154,7 @@ class GraphConv(nn.Module):
 
     def forward(self, graph, feat):
         with graph.local_scope():
-            aggregate_fn = fn.copy_src('h', 'm')
+            aggregate_fn = fn.copy_u("h", "m")
             # if edge_weight is not None:
             #     assert edge_weight.shape[0] == graph.number_of_edges()
             #     graph.edata['_edge_weight'] = edge_weight
@@ -149,10 +178,10 @@ class GraphConv(nn.Module):
             #     rst = graph.dstdata['h']
             # else:
             # aggregate first then mult W
-            graph.srcdata['h'] = feat_src
-            graph.update_all(aggregate_fn, fn.sum(msg='m', out='h'))
-            rst = graph.dstdata['h']
-            
+            graph.srcdata["h"] = feat_src
+            graph.update_all(aggregate_fn, fn.sum(msg="m", out="h"))
+            rst = graph.dstdata["h"]
+
             rst = self.fc(rst)
 
             # if self._norm in ['right', 'both']:

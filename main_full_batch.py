@@ -2,7 +2,7 @@ import logging
 import numpy as np
 from tqdm import tqdm
 import torch
-
+import os
 from utils import (
     build_args,
     create_optimizer,
@@ -14,12 +14,49 @@ from utils import (
 from datasets.data_proc import load_small_dataset
 from models.finetune import linear_probing_full_batch
 from models import build_model
+import sys
+import datetime
 
 
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+class DualLogger(object):
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "a")  # Use "a" to append across seeds
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.terminal.flush()
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+    def close(self):
+        self.log.close()
 
 
-def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_classes, lr_f, weight_decay_f, max_epoch_f, linear_prob, logger=None):
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+
+
+def pretrain(
+    model,
+    graph,
+    feat,
+    optimizer,
+    max_epoch,
+    device,
+    scheduler,
+    num_classes,
+    lr_f,
+    weight_decay_f,
+    max_epoch_f,
+    linear_prob,
+    logger=None,
+):
     logging.info("start training..")
     graph = graph.to(device)
     x = feat.to(device)
@@ -45,12 +82,37 @@ def pretrain(model, graph, feat, optimizer, max_epoch, device, scheduler, num_cl
             logger.note(loss_dict, step=epoch)
 
         if (epoch + 1) % 200 == 0:
-            linear_probing_full_batch(model, graph, x, num_classes, lr_f, weight_decay_f, max_epoch_f, device, linear_prob, mute=True)
+            linear_probing_full_batch(
+                model,
+                graph,
+                x,
+                num_classes,
+                lr_f,
+                weight_decay_f,
+                max_epoch_f,
+                device,
+                linear_prob,
+                mute=True,
+            )
 
     return model
 
 
 def main(args):
+    log_dir = "./logs"
+    os.makedirs(log_dir, exist_ok=True)
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = os.path.join(log_dir, f"graphmae_{args.dataset}_{timestamp}.txt")
+
+    # --- 2. START REDIRECTION ---
+    logger_obj = DualLogger(log_filename)
+    sys.stdout = logger_obj
+
+    print("=" * 50)
+    print(f"Job Started at {timestamp}")
+    print(f"Log file: {log_filename}")
+    print("=" * 50)
     device = args.device if args.device >= 0 else "cpu"
     seeds = args.seeds
     dataset_name = args.dataset
@@ -62,7 +124,7 @@ def main(args):
     decoder_type = args.decoder
     replace_rate = args.replace_rate
 
-    optim_type = args.optimizer 
+    optim_type = args.optimizer
     loss_fn = args.loss_fn
 
     lr = args.lr
@@ -84,7 +146,9 @@ def main(args):
         set_random_seed(seed)
 
         if logs:
-            logger = TBLogger(name=f"{dataset_name}_loss_{loss_fn}_rpr_{replace_rate}_nh_{num_hidden}_nl_{num_layers}_lr_{lr}_mp_{max_epoch}_mpf_{max_epoch_f}_wd_{weight_decay}_wdf_{weight_decay_f}_{encoder_type}_{decoder_type}")
+            logger = TBLogger(
+                name=f"{dataset_name}_loss_{loss_fn}_rpr_{replace_rate}_nh_{num_hidden}_nl_{num_layers}_lr_{lr}_mp_{max_epoch}_mpf_{max_epoch_f}_wd_{weight_decay}_wdf_{weight_decay_f}_{encoder_type}_{decoder_type}"
+            )
         else:
             logger = None
 
@@ -94,24 +158,54 @@ def main(args):
 
         if use_scheduler:
             logging.info("Use schedular")
-            scheduler = lambda epoch :( 1 + np.cos((epoch) * np.pi / max_epoch) ) * 0.5
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=scheduler)
+            scheduler = lambda epoch: (1 + np.cos((epoch) * np.pi / max_epoch)) * 0.5
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=scheduler
+            )
         else:
             scheduler = None
-            
+
         x = graph.ndata["feat"]
         if not load_model:
-            model = pretrain(model, graph, x, optimizer, max_epoch, device, scheduler, num_classes, lr_f, weight_decay_f, max_epoch_f, linear_prob, logger)
+            model = pretrain(
+                model,
+                graph,
+                x,
+                optimizer,
+                max_epoch,
+                device,
+                scheduler,
+                num_classes,
+                lr_f,
+                weight_decay_f,
+                max_epoch_f,
+                linear_prob,
+                logger,
+            )
+            os.makedirs("./checkpoints", exist_ok=True)
+            save_path = f"./checkpoints/{dataset_name}_seed{seed}.pt"
+            torch.save(model.cpu().state_dict(), save_path)
+            logging.info(f"Checkpoint saved to {save_path}")
             model = model.cpu()
 
         if load_model:
             logging.info("Loading Model ... ")
             model.load_state_dict(torch.load("checkpoint.pt"))
-        
+
         model = model.to(device)
         model.eval()
 
-        final_acc, estp_acc = linear_probing_full_batch(model, graph, x, num_classes, lr_f, weight_decay_f, max_epoch_f, device, linear_prob)
+        final_acc, estp_acc = linear_probing_full_batch(
+            model,
+            graph,
+            x,
+            num_classes,
+            lr_f,
+            weight_decay_f,
+            max_epoch_f,
+            device,
+            linear_prob,
+        )
         acc_list.append(final_acc)
         estp_acc_list.append(estp_acc)
 
@@ -122,6 +216,11 @@ def main(args):
     estp_acc, estp_acc_std = np.mean(estp_acc_list), np.std(estp_acc_list)
     print(f"# final_acc: {final_acc:.4f}±{final_acc_std:.4f}")
     print(f"# early-stopping_acc: {estp_acc:.4f}±{estp_acc_std:.4f}")
+
+    # --- 3. CLEAN UP ---
+    print("\nJob Completed.")
+    sys.stdout = logger_obj.terminal  # Restore original stdout
+    logger_obj.close()
 
 
 # Press the green button in the gutter to run the script.
